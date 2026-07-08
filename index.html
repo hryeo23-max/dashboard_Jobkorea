@@ -474,25 +474,52 @@ function renderAlignedGap(chartInst,allMonths,s,e,gapRows){
     if(typeof chartInst.getDom!=='function')return;
     const chartEl=chartInst.getDom();
     if(!chartEl)return;
-    /* Use offsetWidth directly — chart is initialized with correct CSS dimensions */
     const chartW=chartEl.offsetWidth;
     if(chartW<100)return;
     const CELLS_PAD=16, GRID_L=48, GRID_R=24, CHART_PAD=8;
-    const offsetX=-CELLS_PAD;
     const gridW=chartW-CHART_PAD*2-GRID_L-GRID_R;
     const N=e-s+1;
     let boundaryGap=false;
     try{const opt=chartInst.getOption();boundaryGap=opt?.xAxis?.[0]?.boundaryGap===true;}catch(_){}
+    /* Prefer exact pixel positions from ECharts; fall back to math if unavailable */
+    let usePixel=false, pxOffset=0, pxAt=null;
+    try{
+      if(typeof chartInst.convertToPixel==='function'){
+        const test=chartInst.convertToPixel({xAxisIndex:0},0);
+        if(typeof test==='number'&&isFinite(test)){
+          usePixel=true;
+          /* gapCells left edge is CELLS_PAD right of chart-canvas left edge */
+          pxOffset=-CELLS_PAD;
+          pxAt=(li)=>chartInst.convertToPixel({xAxisIndex:0},li);
+        }
+      }
+    }catch(_){usePixel=false;}
     function catX(li){
-      return boundaryGap
-        ? CHART_PAD+GRID_L+(li+0.5)*gridW/N
-        : CHART_PAD+GRID_L+(N>1?li*gridW/(N-1):gridW/2);
+      if(usePixel){return pxOffset+pxAt(li);}
+      if(boundaryGap){return CHART_PAD+GRID_L+(li+0.5)*gridW/N;}
+      const pad=gridW*0.03, usable=gridW-pad*2;
+      return CHART_PAD+GRID_L+pad+(N>1?li*usable/(N-1):usable/2);
     }
+    const offsetX=0;
     const ROW_H=34;
+    const showRowLabel=validRows.length>1;
     cellsArea.style.height=(validRows.length*ROW_H+4)+'px';
     cellsArea.innerHTML='';
-    /* Value cells — no row labels (header already shows "잡코리아 − 사람인 Gap") */
-    /* Value cells below the label */
+    if(showRowLabel){
+      validRows.forEach((row,ri)=>{
+        const m=(row.label||'').match(/\(([^)]+)\)/);
+        let txt=m?m[1]:(row.label||'');
+        /* wrap "1+2+3순위" onto two lines to avoid clashing with values */
+        const disp=txt==='1+2+3순위'?'1+2+3<br>순위':txt;
+        const lbl=document.createElement('div');
+        lbl.style.cssText=`position:absolute;left:0;top:${ri*ROW_H}px;height:${ROW_H}px;`+
+          `display:flex;align-items:center;font-size:9.5px;font-weight:700;color:var(--ink2);`+
+          `line-height:1.15;white-space:nowrap;z-index:2`;
+        lbl.innerHTML=disp;
+        cellsArea.appendChild(lbl);
+      });
+    }
+    /* Value cells (same row as label) */
     for(let gi=s;gi<=e;gi++){
       const absX=offsetX+catX(gi-s);
       validRows.forEach((row,ri)=>{
@@ -699,7 +726,7 @@ function axisOption(months,series,opts){
       axisPointer:{type:opts.shadow?'shadow':'line',lineStyle:{color:'#b9b3a5'}},
       valueFormatter:v=>v==null?'–':(+v).toFixed(1)},
     legend,
-    xAxis:{type:'category',data:months,boundaryGap:!!opts.bar,axisLabel:{fontSize:10.5,color:'#6B7186',hideOverlap:true},axisLine:{lineStyle:{color:'#E0DCD2'}},axisTick:{show:false}},
+    xAxis:{type:'category',data:months,boundaryGap:opts.bar?true:['3%','3%'],axisLabel:{fontSize:10.5,color:'#6B7186',hideOverlap:true},axisLine:{lineStyle:{color:'#E0DCD2'}},axisTick:{show:false}},
     yAxis:{type:'value',scale:opts.scale!==false,max:opts.max||null,min:opts.min||null,axisLabel:{fontSize:10.5,color:'#6B7186',formatter:opts.pct?'{value}%':undefined},splitLine:{lineStyle:{color:'#F0EEE8'}}},
     series
   };
@@ -708,27 +735,64 @@ function axisOption(months,series,opts){
 }
 function mkSeries(list,months,type,opts){
   opts=opts||{};
-  // Compute average value per series so higher-value brands get higher z (label priority in hideOverlap)
   const avgVal=s=>{const vs2=s.values.filter(v=>v!=null);return vs2.length?vs2.reduce((a,c)=>a+c,0)/vs2.length:0;};
   const avgMap=list.map((s,i)=>({i,avg:avgVal(s)})).sort((a,b)=>b.avg-a.avg)
     .reduce((r,{i},rank)=>{r[i]=list.length-rank;return r;},{});
 
+  /* ---- Explicit label visibility rule ----
+     For each month (x position), sort brand values descending; walking down,
+     keep a label only if it's at least MIN_GAP (%p) below the last KEPT label.
+     Bold brands (잡코리아/사람인) are always kept. Values too close to a
+     higher already-shown value are suppressed (lower value hidden first). */
+  const nMonths=months.length;
+  const MIN_GAP=(()=>{
+    /* dynamic threshold: more brands shown → need larger gap to avoid clutter */
+    const shown=list.length;
+    if(shown<=3)return 0;        /* few brands: show all */
+    if(shown<=5)return 1.5;
+    if(shown<=8)return 2.5;
+    return 3.5;                   /* many brands: stricter */
+  })();
+  /* labelShow[seriesIdx][monthIdx] = boolean */
+  const labelShow=list.map(()=>new Array(nMonths).fill(true));
+  if(MIN_GAP>0){
+    for(let m=0;m<nMonths;m++){
+      /* gather (seriesIdx, value, bold) for this month */
+      const pts=[];
+      list.forEach((s,si)=>{
+        const v=s.values[m];
+        if(v==null||v===0)return;
+        pts.push({si,v,bold:isBoldLabel(s.label)});
+      });
+      pts.sort((a,b)=>b.v-a.v); /* high → low */
+      let lastKept=Infinity;
+      pts.forEach(p=>{
+        if(p.bold){ /* always show, and it resets the reference line */
+          labelShow[p.si][m]=true; lastKept=p.v; return;
+        }
+        if(lastKept-p.v>=MIN_GAP){ labelShow[p.si][m]=true; lastKept=p.v; }
+        else { labelShow[p.si][m]=false; } /* too close to a higher shown value */
+      });
+    }
+  }
+
   return list.map((s,i)=>{
     const bold=isBoldLabel(s.label),der=isDeriv(s.label),c=pickColor(s.label,i,opts);
-    // z: bold brands always highest; others ranked by average value so high-% labels survive hideOverlap
     const zVal=bold?(s.label.includes(JK)?200:s.label.includes(SR)?190:180+i):(avgMap[i]||1);
     if(type==='bar'){
-      return {name:s.label,type:'bar',data:s.values,itemStyle:{color:c,borderRadius:[2,2,0,0]},
+      const data=s.values.map((v,m)=>({value:v,label:{show:labelShow[i][m]}}));
+      return {name:s.label,type:'bar',data,itemStyle:{color:c,borderRadius:[2,2,0,0]},
         emphasis:{focus:'series'},z:bold?10:1,
-        labelLayout:{hideOverlap:true,moveOverlap:'shiftY'},
+        labelLayout:{hideOverlap:false,moveOverlap:'shiftY'},
         label:{show:true,position:'top',fontSize:bold?10:9,color:c,fontWeight:bold?700:500,
           formatter:p=>p.value==null?'':(+p.value).toFixed(1)}};
     }
-    return {name:s.label,type:'line',data:s.values.map(v=>v===0?null:v),connectNulls:false,smooth:false,
+    const data=s.values.map((v,m)=>({value:v===0?null:v,label:{show:labelShow[i][m]}}));
+    return {name:s.label,type:'line',data,connectNulls:false,smooth:false,
       symbol:'circle',symbolSize:bold?5:3,showSymbol:true,
       lineStyle:{width:bold?3.2:der?2:1.6,type:der?'dashed':'solid',color:c},itemStyle:{color:c},
       emphasis:{focus:'series'},z:zVal,
-      labelLayout:{hideOverlap:true,moveOverlap:'shiftY'},
+      labelLayout:{hideOverlap:false,moveOverlap:'shiftY'},
       label:{show:true,fontSize:bold?10:9,color:c,fontWeight:bold?700:400,
         formatter:p=>p.value==null?'':(+p.value).toFixed(1)}};
   });
@@ -1158,10 +1222,15 @@ function vRank(v){
         ser.push({name:'1순위',type:'bar',
           data:r1data.map((v,i)=>({value:v,itemStyle:{color:colorsArr[i],borderRadius:[2,2,0,0]}})),
           barMaxWidth:44,z:2,labelLayout:{hideOverlap:true},label:labelFmt()});
+        /* transparent sibling so ECharts sizes bars same as both-mode */
+        ser.push({name:'_w',type:'bar',data:r1data.map(()=>null),barMaxWidth:44,barGap:'-100%',
+          silent:true,legendHoverLink:false,tooltip:{show:false},itemStyle:{color:'transparent'}});
       }else{
         ser.push({name:'1+2+3순위',type:'bar',
           data:r3data.map((v,i)=>({value:v,itemStyle:{color:colorsArr[i],opacity:.55,borderRadius:[2,2,0,0]}})),
           barMaxWidth:44,z:1,labelLayout:{hideOverlap:true},label:labelFmt()});
+        ser.push({name:'_w',type:'bar',data:r3data.map(()=>null),barMaxWidth:44,barGap:'-100%',
+          silent:true,legendHoverLink:false,tooltip:{show:false},itemStyle:{color:'transparent'}});
       }
       // Brand legend: add invisible fake series per brand so legend works like other charts
       const legendData=shownLabels.map((l,i)=>({name:l,icon:'roundRect',
