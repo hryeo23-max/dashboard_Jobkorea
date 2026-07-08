@@ -964,6 +964,33 @@ const SURVEY_Q={
   'SQ4. 직업':'SQ4. 현재 귀하의 직업은 무엇입니까? [1개 선택] ─ 직장인(정규·비정규) / 프리랜서 / 아르바이트 / 대학(원)생 / 구직자 등',
   'R19. 웍스피어 접한 이후 변화':'R19. \'웍스피어(Worxphere)\'라는 기업을 접한 이후, 취업 포털 플랫폼 "잡코리아"에 대해 귀하의 생각과 가장 가까운 정도를 응답해 주십시오. [5점 척도] ─ 신뢰 전이 / 브랜드 대표성 / 이용경험 개선 / 브랜드 선택 보증',
 };
+/* Labels that are not real brands (aggregate/other buckets) — excluded from top-N default */
+function isNonBrand(label){
+  return /^(기타|없음|모름|없음\/모름|해당\s*없음|무응답|전체|계)$/.test((label||'').trim())
+      || (label||'').includes('없음')||(label||'').includes('모름');
+}
+/* Default brand selection: show only the top-N brands ranked by the most-recent
+   non-null month value; hide the rest. Derived/aggregate/non-brand rows ignored.
+   Bold brands (잡코리아/사람인) are always shown. */
+function applyTop5Default(seriesList,months,vs,topN){
+  topN=topN||5;
+  const opts=seriesList.filter(s=>!isDeriv(s.label)&&!isNonBrand(s.label));
+  if(opts.length<=topN)return;
+  let mIdx=-1;
+  for(let m=months.length-1;m>=0;m--){
+    if(opts.some(s=>s.values[m]!=null&&s.values[m]!==0)){mIdx=m;break;}
+  }
+  if(mIdx<0)return;
+  const ranked=opts.map(s=>({label:s.label,v:(s.values[mIdx]==null?-Infinity:s.values[mIdx]),
+      bold:isBoldLabel(s.label)}))
+    .sort((a,b)=>b.v-a.v);
+  const keep=new Set();
+  ranked.slice(0,topN).forEach(r=>keep.add(r.label));
+  ranked.forEach(r=>{if(r.bold)keep.add(r.label);});
+  /* hide everything not kept — including non-brand buckets */
+  seriesList.filter(s=>!isDeriv(s.label)).forEach(s=>{if(!keep.has(s.label))vs.hidden.add(s.label);});
+}
+
 function renderView(v){
   vs={ct:v.recommended||'line',isRec:true,unit:(v.metrics&&v.metrics[0])||'%',month:null,rs:null,re:null,
       hidden:new Set(),selAttr:null,attrHidden:new Set(),rankSel:{r1:true,r123:v.recommended==='bar'},tabIdx:0,stackMode:'pct'};
@@ -1020,7 +1047,7 @@ function vTrend(v){
       if(ia>=0&&ib>=0)return ia-ib;if(ia>=0)return -1;if(ib>=0)return 1;return 0;});
     opts.forEach(s=>{if(!albaOrder.includes(s.label))vs.hidden.add(s.label);});
     focus=opts[0];
-  }else if(opts.length>8)opts.forEach(s=>{if(!big.some(x=>s.label.includes(x)))vs.hidden.add(s.label);});
+  }else applyTop5Default(opts,b.months,vs);
   const jkS=opts.find(s=>s.label.includes(JK)),srS=opts.find(s=>s.label.includes(SR));
   function paint(){
     const body=document.getElementById('vbody');
@@ -1066,7 +1093,22 @@ function vScale(v){
   const blocks=v.members.map(t=>byTitle[t]).filter(Boolean);
   const brands=blocks.map(b=>({brand:brandOf(b.title),b}));
   const big=[JK,SR,'인크루트','워크넷','원티드','잡플래닛'];
-  brands.forEach(x=>{if(!big.some(p=>x.brand.includes(p)))vs.hidden.add(x.brand);});
+  /* default: top-5 brands by most recent non-null value of the primary metric */
+  (function(){
+    if(brands.length<=5)return;
+    const refUnit0=hasMean(brands[0].b)?'Top2%':(hasMean10(brands[0].b)?'Top5%':'Top2%');
+    const rows=brands.filter(x=>!isNonBrand(x.brand)).map(x=>{
+      const r=metricRow(x.b,refUnit0)||metricRow(x.b,'Top2%');
+      const vals=r?r.values:[];
+      let lv=-Infinity;
+      for(let m=vals.length-1;m>=0;m--){if(vals[m]!=null){lv=vals[m];break;}}
+      return {brand:x.brand,v:lv,bold:isBoldLabel(x.brand)};
+    }).sort((a,b)=>b.v-a.v);
+    const keep=new Set();
+    rows.slice(0,5).forEach(r=>keep.add(r.brand));
+    rows.forEach(r=>{if(r.bold)keep.add(r.brand);});
+    brands.forEach(x=>{if(!keep.has(x.brand))vs.hidden.add(x.brand);});
+  })();
   const jk=brands.find(x=>x.brand.includes(JK)),sr=brands.find(x=>x.brand.includes(SR));
   const refB=jk?jk.b:brands[0].b;
   const hM=hasMean(refB), hN=hasNPS(refB), hM10=!hM&&hasMean10(refB);
@@ -1135,7 +1177,7 @@ function vRank(v){
   const b1=byTitle[v.members[0]],b3=byTitle[v.members[1]];
   const opts=(b1||b3).series.filter(s=>!isDeriv(s.label));
   const big=[JK,SR,'인크루트','워크넷','원티드','잡플래닛'];
-  if(opts.length>8)opts.forEach(s=>{if(!big.some(x=>s.label.includes(x)))vs.hidden.add(s.label);});
+  applyTop5Default((b1||b3).series,(b1||b3).months,vs);
   const months=(b1||b3).months;
   ensureDefaultRange(vs,months);
   const jk1=b1&&b1.series.find(s=>s.label.includes(JK)),sr1=b1&&b1.series.find(s=>s.label.includes(SR));
@@ -1297,7 +1339,7 @@ function vStack(v){
   ensureDefaultRange(vs,b.months);
   function paint(){
     const body=document.getElementById('vbody');
-    body.innerHTML=`<div class="subline">단일 응답 문항입니다. 차트 형태와 기간(또는 월)을 선택해 구성을 볼 수 있습니다.</div>
+    body.innerHTML=`<div class="subline" style="min-height:16px"></div>
       <div class="card">
         <div class="ctrl-bar">
           <span class="ctrl-label">기간</span>${periodCtrlHTML(b.months,vs.ct,vs)}
@@ -1421,10 +1463,23 @@ function vRadarOne(v){
   const blocks=v.members.map(t=>byTitle[t]).filter(Boolean);
   const brandsAll=blocks.map(b=>brandOf(b.title));
   const big=[JK,SR,'인크루트','워크넷','원티드'];
-  brandsAll.forEach(bn=>{if(!big.some(p=>bn.includes(p)))vs.hidden.add(bn);});
   const attrs=blocks[0].series.map(s=>s.label).filter(l=>!l.includes('없음')&&!l.includes('미인지'));
   vs.selAttr=vs.selAttr||attrs[0];
   if(vs.attrHidden.size===0)attrs.forEach(a=>{if(a!==vs.selAttr)vs.attrHidden.add(a);});
+  /* default: top-5 brands by latest-month value of the selected attribute */
+  (function(){
+    if(brandsAll.length<=5)return;
+    const rows=blocks.filter(b=>!isNonBrand(brandOf(b.title))).map(b=>{
+      const ser=b.series.find(s=>s.label===vs.selAttr);
+      const vals=ser?ser.values:[];
+      let lv=-Infinity;for(let m=vals.length-1;m>=0;m--){if(vals[m]!=null){lv=vals[m];break;}}
+      return {brand:brandOf(b.title),v:lv,bold:isBoldLabel(brandOf(b.title))};
+    }).sort((a,b)=>b.v-a.v);
+    const keep=new Set();
+    rows.slice(0,5).forEach(r=>keep.add(r.brand));
+    rows.forEach(r=>{if(r.bold)keep.add(r.brand);});
+    brandsAll.forEach(bn=>{if(!keep.has(bn))vs.hidden.add(bn);});
+  })();
   const months=blocks[0].months;
   ensureDefaultRange(vs,months);
   if(vs.month===months.length-1)vs.month=lastDataIdx(blocks,attrs);
@@ -1432,7 +1487,7 @@ function vRadarOne(v){
   function paint(){
     const body=document.getElementById('vbody');
     const showAttrPicker=vs.ct!=='radar';
-    body.innerHTML=`<div class="subline">${vs.ct==='radar'?'브랜드별 이미지 속성을 방사형으로 비교합니다(속성 다중 축, 브랜드 다중 선택).':'속성을 하나 선택해 브랜드별로 비교합니다.'}</div>
+    body.innerHTML=`<div class="subline" style="min-height:16px"></div>
       <div class="card">
         <div class="ctrl-bar">
           <span class="ctrl-label">브랜드</span>${brandDropHTML(brandsAll,vs,'brandDd')}
@@ -1509,7 +1564,7 @@ function vRadarOne(v){
 function vBPI(v){
   const bp=DATA.bpi;
   const jk=bp.series.find(s=>s.label.includes(JK)),sr=bp.series.find(s=>s.label.includes(SR)),gap=bp.series.find(s=>s.label.includes('Gap'));
-  bp.series.forEach(s=>{if(s.label.includes('Gap'))return;const big=[JK,SR,'인크루트','워크넷','원티드','잡플래닛'];if(!big.some(p=>s.label.includes(p)))vs.hidden.add(s.label);});
+  applyTop5Default(bp.series.filter(s=>!s.label.includes('Gap')),bp.months,vs);
   ensureDefaultRange(vs,bp.months);
   const brands=bp.series.filter(s=>!s.label.includes('Gap'));
   function paint(){
@@ -1577,7 +1632,7 @@ function tableCardMulti(blocks,fname){
   return `<div class="card collapsed" id="tcard">
     <div class="card-h"><div class="t" style="cursor:pointer" id="ttog"><span class="chev">▾</span> 원본 데이터 테이블 · 연계 ${blocks.length}개</div>
       <button class="btn" id="csv">CSV 다운로드(전체)</button></div>
-    <div style="padding:10px 16px 0;display:flex;gap:6px;flex-wrap:wrap">${tabs}</div>
+    <div style="padding:10px 16px 12px;display:flex;gap:6px;flex-wrap:wrap">${tabs}</div>
     <div id="tcont">${oneTableInner(blocks[cur])}</div></div>`;
 }
 function wireTableMulti(blocks,fname,vstate){
